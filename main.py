@@ -1,20 +1,44 @@
-import requests
-from typing import List, Dict, Any
-from typing import List
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
+import io
+from fastapi import FastAPI, File, UploadFile, HTTPException
 import face_recognition
 import numpy as np
+import pickle
+import os
+import uuid
+from asyncpg import create_pool
+from typing import Dict
 from PIL import Image
-import io
-
-prefix_endpoint = "pytrueface"
 
 app = FastAPI()
 
+# For storing face encodings in-memory
+known_face_encodings = {}
+# Database connection pool
+pool = None
 
-@app.post(f"{prefix_endpoint}/encode-face")
-async def encode_face(label: str, file: UploadFile = File(...)):
+@app.on_event("startup")
+async def startup():
+    global pool
+    pool = await create_pool('your_postgres_connection_string')
+    
+    # Create face_encodings directory if not exists
+    if not os.path.exists("face_encodings"):
+        os.makedirs("face_encodings")
+
+    # Load known faces from PostgreSQL to memory
+    async with pool.acquire() as connection:
+        rows = await connection.fetch('SELECT label, file_name FROM faces')
+        for row in rows:
+            label = row['label']
+            file_name = row['file_name']
+            # Load face encoding from file
+            with open(os.path.join("face_encodings", f"{file_name}.pkl"), 'rb') as f:
+                face_encoding = pickle.load(f)
+                known_face_encodings[label] = face_encoding
+                
+
+@app.post("/addFace")
+async def add_face(label: str, file: UploadFile = File(...)):
     try:
         # Convert the file data to an image.
         image = Image.open(io.BytesIO(await file.read()))
@@ -25,81 +49,35 @@ async def encode_face(label: str, file: UploadFile = File(...)):
 
         # If no faces were found, return an error.
         if len(face_encodings) == 0:
-            return JSONResponse(status_code=400, content={
-                "code": 400,
-                "message": "No faces found in image."
-            })
+            raise HTTPException(status_code=400, detail="No faces found in image.")
 
         # If multiple faces were found, return an error.
         elif len(face_encodings) > 1:
-            return JSONResponse(status_code=400, content={
-                "code": 400,
-                "message": "Multiple faces found in image."
-            })
+            raise HTTPException(status_code=400, detail="Multiple faces found in image.")
 
-        # Return the face encoding data.
-        # Convert numpy array to list for JSON serialization
-        face_encoding = face_encodings[0].tolist()
+        # Save face encoding to file
+        unique_name = str(uuid.uuid4())
+        file_path = os.path.join("face_encodings", f"{unique_name}.pkl")
+        with open(file_path, 'wb') as f:
+            pickle.dump(face_encodings[0], f)
+
+        # Save label and encoding file name to database
+        async with pool.acquire() as connection:
+            await connection.execute(
+                'INSERT INTO faces (label, file_name) VALUES ($1, $2)',
+                label,
+                unique_name
+            )
+
+        # Also save face encoding in memory
+        known_face_encodings[label] = face_encodings[0]
 
         return {
             "code": 200,
-            "message": "Calculate face encoding successful",
+            "message": "Face encoding calculated and stored successfully",
             "label": label,
-            "face_encoding": face_encoding
+            "file_name": unique_name
         }
 
     except Exception as e:
-        return JSONResponse(status_code=500, content={
-            "code": 500,
-            "message": str(e)
-        })
-
-
-@app.post("/recognize-face")
-async def recognize_face(file: UploadFile = File(...), encodings_url: str = ''):
-    try:
-        # Convert the file data to an image.
-        image = Image.open(io.BytesIO(await file.read()))
-        image = np.array(image)
-
-        # Detect the face encodings for the uploaded image.
-        face_encodings = face_recognition.face_encodings(image)
-
-        if len(face_encodings) == 0:
-            return JSONResponse(status_code=400, content={
-                "code": 400,
-                "message": "No faces found in image."
-            })
-
-        # Fetch face encodings from the provided URL.
-        response = requests.get(encodings_url)
-        response.raise_for_status()
-        known_encodings: List[Dict[str, Any]] = response.json()
-
-        for known in known_encodings:
-            # Ensure the encoding is a numpy array.
-            known_encoding = np.array(known['face_encoding'])
-            for face_encoding in face_encodings:
-                # Compare face encodings.
-                matches = face_recognition.compare_faces(
-                    [known_encoding], face_encoding)
-
-                if True in matches:
-                    return {
-                        "code": 200,
-                        "message": "Face recognized",
-                        "label": known['label'],
-                        "face_data": face_encoding.tolist(),
-                    }
-
-        # If no matches were found, return an error.
-        return JSONResponse(status_code=400, content={
-            "code": 400,
-            "message": "No matching face found.",
-        })
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={
-            "code": 500,
-            "message": str(e)
-        })
+        return HTTPException(status_code=500, detail=str(e))
