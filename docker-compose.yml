@@ -7,3 +7,16 @@ services:
       - .:/app
     ports:
       - "8000:8000"
+    depends_on:
+      - postgres
+    environment:
+      - DATABASE_URL=postgresql://hlm:1qaz!QAZ@postgres:5432/pytrueface
+  postgres:
+    image: postgres:alpine
+    restart: always
+    environment:
+      POSTGRES_USER: hlm
+      POSTGRES_PASSWORD: 1qaz!QAZ
+      POSTGRES_DB: pytrueface
+    volumes:
+      - ./data/db:/var/lib/postgresql/data

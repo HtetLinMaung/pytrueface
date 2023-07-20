@@ -19,7 +19,7 @@ pool = None
 @app.on_event("startup")
 async def startup():
     global pool
-    pool = await create_pool('your_postgres_connection_string')
+    pool = await create_pool(os.getenv('DATABASE_URL'))
     
     # Create face_encodings directory if not exists
     if not os.path.exists("face_encodings"):
